@@ -1,0 +1,649 @@
+#!/usr/bin/env node
+'use strict';
+/*
+ * ccsweep: see and stop what Claude Code chats started on your Mac.
+ *
+ * Every command Claude Code runs carries CLAUDECODE=1, CLAUDE_PID (the claude process that ran it)
+ * and CLAUDE_CODE_SESSION_ID in its environment, and so does everything that command starts, even
+ * after the chat has closed. `ps -E` shows those markers, so ccsweep can tell the dev servers,
+ * databases, scripts and test browsers Claude started apart from your own apps, and whether the
+ * chat that started each one is still open.
+ *
+ * https://github.com/Prathameshppawar/ccsweep · MIT licence · not affiliated with Anthropic
+ */
+
+const { spawnSync, spawn } = require('child_process');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const readline = require('readline');
+
+const VERSION = '1.0.0';
+const HOME = os.homedir();
+const UID = String(process.getuid ? process.getuid() : '');
+const CLAUDE_DIR = process.env.CLAUDE_CONFIG_DIR || path.join(HOME, '.claude');
+const SETTINGS = path.join(CLAUDE_DIR, 'settings.json');
+const SKILL_DIR = path.join(CLAUDE_DIR, 'skills', 'ccsweep');
+const LOG_FILE = path.join(CLAUDE_DIR, 'ccsweep.log');
+const LABEL = 'dev.ccsweep.sweep';
+const PLIST = path.join(HOME, 'Library', 'LaunchAgents', LABEL + '.plist');
+const SELF = fs.realpathSync(__filename);
+
+const SHELLS = new Set(['zsh', 'bash', 'sh', 'dash', 'fish']);
+const AUTOMATED = /--remote-debugging|--headless|--enable-automation|--test-type=|ms-playwright|puppeteer/;
+const WINDOW_STAYS_OPEN = new Set(['clear', 'resume', 'compact']);
+const SCRATCH = /(?:\/private)?\/tmp\/claude-\d+\/([^/\s]+)\/[0-9a-f-]{36}\/scratchpad/;
+// Claude Code runs each command as `zsh -c source <its shell snapshot> ... eval '<command>'`. The
+// snapshot belongs to one chat and is deleted when that chat closes.
+const WRAPPER = /^\S*(?:zsh|bash)\s+-c\s+(?:-l\s+)?source\s+(\S*\/shell-snapshots\/snapshot-[^\s'"]+)/;
+
+process.stdout.on('error', () => process.exit(0));
+
+function run(cmd, args, timeout = 15000) {
+  const r = spawnSync(cmd, args, { encoding: 'utf8', maxBuffer: 512 * 1024 * 1024, timeout });
+  return { ok: r.status === 0, stdout: r.stdout || '', stderr: r.stderr || '' };
+}
+function sleep(ms) { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }
+const nameOf = p => path.basename(p.comm.trim()).replace(/^-/, '');
+const shq = s => (/^[\w@%+=:,./-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`);
+const xml = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+function isClaudeBinary(p) {
+  if (!p) return false;
+  return nameOf(p) === 'claude' || /\/claude\/versions\/[^/]+$/.test(p.comm.trim()) ||
+    /@anthropic-ai\/claude-code\/cli/.test(p.cmd);
+}
+
+// ---------------------------------------------------------------- reading the process table
+
+function snapshot() {
+  const procs = new Map();
+  for (const line of run('ps', ['-axww', '-o', 'pid=,ppid=,pcpu=,rss=,etime=,stat=,comm=']).stdout.split('\n')) {
+    const m = line.match(/^\s*(\d+)\s+(\d+)\s+([\d.]+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(.*)$/);
+    if (m) {
+      procs.set(+m[1], {
+        pid: +m[1], ppid: +m[2], cpu: +m[3], rssKB: +m[4], etime: m[5], stat: m[6], comm: m[7], cmd: m[7],
+        claude: false, claudePid: 0, sessionId: '', snapshot: '',
+      });
+    }
+  }
+  for (const line of run('ps', ['-axww', '-o', 'pid=,command=']).stdout.split('\n')) {
+    const m = line.match(/^\s*(\d+) (.*)$/);
+    const p = m && procs.get(+m[1]);
+    if (!p) continue;
+    p.cmd = m[2];
+    const w = p.cmd.match(WRAPPER);   // macOS hides the environment of its own programs (zsh,
+    if (w) { p.claude = true; p.snapshot = w[1]; }   // sleep, perl…), so spot Claude's shells by name
+  }
+  // With -E, ps prints each of your processes' command followed by its environment.
+  for (const line of run('ps', ['-Eww', '-U', UID, '-o', 'pid=,command=']).stdout.split('\n')) {
+    const m = line.match(/^\s*(\d+) (.*)$/);
+    const p = m && procs.get(+m[1]);
+    if (!p) continue;
+    const env = m[2].startsWith(p.cmd) ? m[2].slice(p.cmd.length) : m[2];
+    if (!/(?:^|\s)CLAUDECODE=1(?:\s|$)/.test(env)) continue;
+    p.claude = true;
+    p.claudePid = +((env.match(/(?:^|\s)CLAUDE_PID=(\d+)(?:\s|$)/) || [])[1] || 0);
+    p.sessionId = (env.match(/(?:^|\s)CLAUDE_CODE_SESSION_ID=([0-9a-f-]{36})(?:\s|$)/) || [])[1] || '';
+  }
+  const children = new Map();
+  for (const p of procs.values()) {
+    if (!children.has(p.ppid)) children.set(p.ppid, []);
+    children.get(p.ppid).push(p.pid);
+  }
+  return { procs, children };
+}
+
+function ancestry(procs, pid) {
+  const out = [];
+  for (let p = procs.get(pid); p && out.length < 64; p = procs.get(p.ppid)) {
+    out.push(p);
+    if (p.ppid <= 1) break;
+  }
+  return out;
+}
+
+// One item per service: a Claude-started process with no Claude-started ancestor, plus everything
+// below it. ccsweep's own command line is never listed.
+function collect() {
+  const { procs, children } = snapshot();
+  const myChain = ancestry(procs, process.pid);
+  const mine = new Set(myChain.map(p => p.pid));
+  const ownClaude = myChain.find(isClaudeBinary);
+  const tracked = p => !!p && p.claude && !mine.has(p.pid) && !isClaudeBinary(p);
+  const placement = p => {
+    for (let a = procs.get(p.ppid); a && a.pid > 1; a = procs.get(a.ppid)) {
+      if (isClaudeBinary(a)) return 'root';
+      if (mine.has(a.pid)) return 'mine';
+      if (tracked(a)) return 'child';
+    }
+    return 'root';
+  };
+  const appRe = new RegExp('^((?:/Applications|/System/Applications|' +
+    HOME.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '/Applications)/[^/]+\\.app)/');
+  // Which claude process each shell snapshot belongs to, seen from shells still under it.
+  const snapshotOwner = new Map();
+  for (const p of procs.values()) {
+    if (!p.snapshot || snapshotOwner.has(p.snapshot)) continue;
+    const owner = ancestry(procs, p.pid).find(isClaudeBinary);
+    if (owner) snapshotOwner.set(p.snapshot, owner.pid);
+  }
+
+  const items = [];
+  for (const root of procs.values()) {
+    if (!tracked(root) || placement(root) !== 'root') continue;
+    const tree = [];
+    const queue = [root.pid];
+    while (queue.length) {
+      const q = procs.get(queue.shift());
+      if (!q || mine.has(q.pid) || isClaudeBinary(q)) continue;
+      tree.push(q);
+      for (const c of children.get(q.pid) || []) queue.push(c);
+    }
+    let claudePid = root.claudePid || (tree.find(q => q.claudePid) || {}).claudePid || 0;
+    if (!claudePid) {
+      for (let a = procs.get(root.ppid); a && a.pid > 1; a = procs.get(a.ppid)) {
+        if (isClaudeBinary(a)) { claudePid = a.pid; break; }
+      }
+    }
+    const snapshot = (tree.find(q => q.snapshot) || {}).snapshot || '';
+    if (!claudePid && snapshot) claudePid = snapshotOwner.get(snapshot) || 0;
+    const open = claudePid ? isClaudeBinary(procs.get(claudePid))
+      : snapshot ? fs.existsSync(snapshot)
+        : root.ppid !== 1;
+    const bundle = (root.comm.match(appRe) || [])[1] || null;
+    items.push({
+      root, tree, claudePid, open,
+      chat: claudePid ? 'pid:' + claudePid : snapshot ? 'snapshot:' + snapshot : 'unknown',
+      sessionId: root.sessionId || (tree.find(q => q.sessionId) || {}).sessionId || '',
+      shown: tree.find(q => !SHELLS.has(nameOf(q))) || root,
+      thisChat: !!ownClaude && claudePid === ownClaude.pid,
+      app: bundle && !tree.some(q => AUTOMATED.test(q.cmd)) ? bundle : null,
+      cpu: tree.reduce((s, q) => s + q.cpu, 0),
+      rssKB: tree.reduce((s, q) => s + q.rssKB, 0),
+      ports: [], cwd: '', folder: '',
+    });
+  }
+  items.sort((a, b) => (a.open - b.open) || a.chat.localeCompare(b.chat) || (a.root.pid - b.root.pid));
+  return items;
+}
+
+// Left over = the chat that started it has closed. Apps never count: quitting Docker Desktop,
+// say, would take down containers that other chats are using.
+const isLeftover = i => !i.app && !i.open;
+
+// "-Users-me-code-my-app" -> "/Users/me/code/my-app" (Claude Code turns every other character
+// into "-" when it names a project folder, so match against what is really on disk).
+function decodeProject(enc) {
+  const parts = enc.replace(/^-/, '').split('-');
+  const norm = s => s.replace(/[^A-Za-z0-9]/g, '-');
+  const walk = (dir, i) => {
+    if (i === parts.length) return dir;
+    let names;
+    try { names = fs.readdirSync(dir); } catch { return null; }
+    for (let j = parts.length; j > i; j--) {
+      const want = parts.slice(i, j).join('-');
+      for (const name of names) {
+        if (norm(name) === want) { const found = walk(path.join(dir, name), j); if (found) return found; }
+      }
+    }
+    return null;
+  };
+  return walk('/', 0);
+}
+
+// The project a chat was working in, from Claude Code's own record of the chat.
+function chatProject(sessionId) {
+  if (!sessionId) return '';
+  const dir = path.join(CLAUDE_DIR, 'projects');
+  let entries;
+  try { entries = fs.readdirSync(dir); } catch { return ''; }
+  for (const e of entries) if (fs.existsSync(path.join(dir, e, sessionId + '.jsonl'))) return decodeProject(e) || '';
+  return '';
+}
+
+// Ports, folders and chat projects; lsof is slow, so only when something is shown or stopped.
+function enrich(items) {
+  const listening = new Map();
+  let cur = 0;
+  for (const line of run('lsof', ['-nP', '-iTCP', '-sTCP:LISTEN', '-Fpn'], 10000).stdout.split('\n')) {
+    if (line[0] === 'p') cur = +line.slice(1);
+    else if (line[0] === 'n' && cur) {
+      if (!listening.has(cur)) listening.set(cur, new Set());
+      listening.get(cur).add(line.slice(line.lastIndexOf(':') + 1));
+    }
+  }
+  const pids = new Set(items.map(i => i.root.pid));
+  for (const i of items) if (i.open) pids.add(i.claudePid);
+  const cwd = new Map();
+  if (pids.size) {
+    cur = 0;
+    for (const line of run('lsof', ['-a', '-d', 'cwd', '-Fn', '-p', [...pids].join(',')], 10000).stdout.split('\n')) {
+      if (line[0] === 'p') cur = +line.slice(1);
+      else if (line[0] === 'n' && cur) cwd.set(cur, line.slice(1));
+    }
+  }
+  const projects = new Map();
+  for (const it of items) {
+    const ports = new Set();
+    for (const q of it.tree) for (const port of listening.get(q.pid) || []) ports.add(port);
+    it.ports = [...ports].sort((a, b) => a - b);
+    it.cwd = cwd.get(it.root.pid) || '';
+    if (!projects.has(it.chat)) {
+      let project = chatProject(it.sessionId);
+      if (!project && it.open && it.claudePid) project = cwd.get(it.claudePid) || '';
+      if (!project) {
+        const m = [it.cwd, ...it.tree.map(q => q.cmd)].join(' ').match(SCRATCH);
+        if (m) project = decodeProject(m[1]) || '';
+      }
+      projects.set(it.chat, project);
+    }
+    it.folder = projects.get(it.chat);
+  }
+}
+
+// ---------------------------------------------------------------- showing
+
+function age(et) {
+  const m = et.match(/^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$/);
+  if (!m) return et;
+  const d = +(m[1] || 0), h = +(m[2] || 0), min = +m[3];
+  return d ? `${d}d ${h}h` : h ? `${h}h ${min}m` : `${min}m`;
+}
+const mb = kb => (kb >= 1048576 ? (kb / 1048576).toFixed(1) + ' GB' : Math.round(kb / 1024) + ' MB');
+
+function tidy(s) {
+  return (s || '').replace(new RegExp(SCRATCH.source, 'g'), '‹scratchpad›')
+    .split(HOME).join('~').replace(/\s+/g, ' ').trim();
+}
+
+function describe(it) {
+  if (it.app) return path.basename(it.app, '.app') + ' (app)';
+  const p = it.shown;
+  let s = p.cmd;
+  if (SHELLS.has(nameOf(p))) {                       // a Claude Bash wrapper: show what it runs
+    const m = s.match(/eval '((?:[^']|'\\'')*)'/);
+    if (m) s = m[1].replace(/'\\''/g, "'");
+  } else if (p.comm.includes('/') && s.startsWith(p.comm)) {
+    s = path.basename(p.comm) + s.slice(p.comm.length);   // /opt/.../bin/postgres -> postgres
+  }
+  return tidy(s
+    .replace(/\s--(?:require|import|loader)[ =]\S+/g, '')
+    .replace(/^node\s+\S*node_modules\/\.bin\/(\S+)/, '$1')  // node …/.bin/next dev -> next dev
+    .replace(/^python[\d.]*\s+-m\s+/, ''));                   // python -m uvicorn -> uvicorn
+}
+
+const fit = (s, w) => (s.length <= w ? s.padEnd(w) : s.slice(0, Math.max(0, w - 1)) + '…');
+const fitRight = (s, w) => (s.length <= w ? s.padStart(w) : s.slice(0, w));
+
+function printList(items) {
+  if (!items.length) { console.log('Nothing started by a Claude chat is running.'); return; }
+  const width = process.stdout.isTTY ? Math.max(100, process.stdout.columns || 120) : 160;
+  const cols = [['#', 3, 1], ['PID', 6], ['AGE', 7], ['CPU', 6, 1], ['MEM', 7, 1], ['PORTS', 11], ['FOLDER', 28]];
+  const fixed = 2 + cols.reduce((s, c) => s + c[1] + 1, 0);
+  const row = v => ('  ' + cols.map((c, k) => (c[2] ? fitRight : fit)(v[k], c[1])).join(' ') + ' ' +
+    fit(v[cols.length], width - fixed)).trimEnd();
+  let last = null;
+  items.forEach((it, k) => {
+    it.n = k + 1;
+    if (it.chat !== last) {
+      last = it.chat;
+      const where = it.folder ? ' · ' + tidy(it.folder) : it.claudePid ? ` (claude pid ${it.claudePid})` : '';
+      console.log('\n' + (it.open ? `● Open chat${it.thisChat ? ' (this one)' : ''}${where}`
+        : `○ Closed chat${where} — left running`));
+      console.log(row([...cols.map(c => c[0]), 'WHAT']));
+    }
+    console.log(row([String(it.n), String(it.root.pid), age(it.root.etime), it.cpu.toFixed(1) + '%',
+      mb(it.rssKB), it.ports.join(',') || '-', tidy(it.cwd) || '-', describe(it)]));
+  });
+}
+
+function printFooter(items, menu) {
+  const lines = [];
+  const left = items.filter(isLeftover).length;
+  if (left) lines.push(`${left} left running by closed chats · ${menu ? 'type c to stop them all' : 'ccsweep clean stops them'}`);
+  if (items.some(i => i.app)) lines.push('Apps are never stopped automatically; pick one to have it quit.');
+  const d = run('docker', ['ps', '--format', '{{.Names}}'], 5000);
+  if (d.ok) {
+    const names = d.stdout.split('\n').filter(Boolean);
+    lines.push(names.length
+      ? `Docker: ${names.length} container(s) running (${names.join(', ')}); ccsweep can't see who started them`
+      : 'Docker: no containers running');
+  }
+  if (lines.length) console.log('\n' + lines.join('\n'));
+}
+
+function toJson(it) {
+  return {
+    pid: it.root.pid, pids: it.tree.map(q => q.pid), what: describe(it), folder: tidy(it.cwd),
+    chatFolder: tidy(it.folder), ports: it.ports, age: age(it.root.etime), cpu: +it.cpu.toFixed(1),
+    memMB: Math.round(it.rssKB / 1024), claudePid: it.claudePid, sessionId: it.sessionId,
+    chatOpen: it.open, thisChat: it.thisChat, app: !!it.app, leftover: isLeftover(it),
+  };
+}
+
+// ---------------------------------------------------------------- stopping
+
+function writeLog(line) {
+  try {
+    fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true });
+    if (fs.existsSync(LOG_FILE) && fs.statSync(LOG_FILE).size > 512 * 1024) {
+      fs.writeFileSync(LOG_FILE, fs.readFileSync(LOG_FILE, 'utf8').split('\n').slice(-2000).join('\n'));
+    }
+    const now = new Date();
+    const stamp = new Date(now - now.getTimezoneOffset() * 60000).toISOString().slice(0, 19).replace('T', ' ');
+    fs.appendFileSync(LOG_FILE, `${stamp}  ${line}\n`);
+  } catch { /* logging must never stop the cleanup */ }
+}
+
+function signal(pid, sig) { try { process.kill(pid, sig); } catch { /* already gone */ } }
+
+function living(pids) {
+  if (!pids.length) return [];
+  return run('ps', ['-o', 'pid=,stat=', '-p', pids.join(',')]).stdout.split('\n')
+    .map(l => l.trim().split(/\s+/)).filter(f => f[0] && !/^Z/.test(f[1] || '')).map(f => +f[0]);
+}
+
+function label(it) {
+  const extra = [`pid ${it.root.pid}`];
+  if (it.ports.length) extra.push('port ' + it.ports.join(','));
+  return `${describe(it)}  [${extra.join(', ')}]`;
+}
+
+// Services get SIGTERM (Postgres gets SIGINT, its clean "fast shutdown"), then SIGKILL after 5 s.
+// Apps are asked to quit through macOS, and whatever is left of them gets SIGTERM.
+function stopItems(items, why, { dryRun = false, quiet = false } = {}) {
+  if (!items.length) { if (!quiet) console.log('Nothing to stop.'); return; }
+  if (dryRun) { for (const it of items) console.log('would stop  ' + label(it)); return; }
+  const appPids = new Set();
+  const watch = [];
+  for (const it of items) {
+    if (it.app) {
+      const id = run('defaults', ['read', it.app + '/Contents/Info', 'CFBundleIdentifier']).stdout.trim();
+      if (id) run('osascript', ['-e', `quit app id "${id.replace(/"/g, '')}"`], 30000);
+      it.tree.forEach(q => appPids.add(q.pid));
+    } else if (nameOf(it.root) === 'postgres') {
+      signal(it.root.pid, 'SIGINT');
+    } else {
+      for (const q of [...it.tree].reverse()) signal(q.pid, 'SIGTERM');
+    }
+    watch.push(...it.tree.map(q => q.pid));
+  }
+  const until = Date.now() + (appPids.size ? 10000 : 5000);
+  let left = living(watch);
+  while (left.length && Date.now() < until) { sleep(150); left = living(watch); }
+  const forced = new Set(left);
+  if (left.length) { for (const pid of left) signal(pid, appPids.has(pid) ? 'SIGTERM' : 'SIGKILL'); sleep(1500); }
+  const still = new Set(living(watch));
+  for (const it of items) {
+    let result = it.app ? 'quit' : 'stopped';
+    if (it.tree.some(q => still.has(q.pid))) result = 'still running';
+    else if (!it.app && it.tree.some(q => forced.has(q.pid))) result = 'killed';
+    writeLog(`${why}: ${result} ${label(it)}${it.cwd ? ' in ' + tidy(it.cwd) : ''}`);
+    if (!quiet) console.log(`${result.padEnd(9)} ${label(it)}`);
+  }
+}
+
+function ask(question) {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise(resolve => rl.question(question, a => { rl.close(); resolve(a.trim()); }));
+}
+
+// ---------------------------------------------------------------- install, uninstall, status
+
+const isOurHook = h => !!h && h.type === 'command' && /ccsweep'?\s+hook-end\b/.test(h.command || '');
+
+function findNode() {
+  for (const dir of (process.env.PATH || '').split(':').filter(Boolean)) {
+    const candidate = path.join(dir, 'node');
+    try { fs.accessSync(candidate, fs.constants.X_OK); return candidate; } catch { /* keep looking */ }
+  }
+  return process.execPath;
+}
+
+function readSettings() {
+  if (!fs.existsSync(SETTINGS)) return { text: null, data: {} };
+  const text = fs.readFileSync(SETTINGS, 'utf8');
+  try { return { text, data: text.trim() ? JSON.parse(text) : {} }; }
+  catch { throw new Error(`${tidy(SETTINGS)} is not valid JSON. Fix it, then run this again.`); }
+}
+
+function writeSettings(text, data) {
+  if (text !== null) fs.writeFileSync(SETTINGS + '.ccsweep-backup', text);
+  fs.mkdirSync(path.dirname(SETTINGS), { recursive: true });
+  fs.writeFileSync(SETTINGS, JSON.stringify(data, null, 2) + '\n');
+}
+
+function withoutOurHook(data) {
+  const hooks = data.hooks || {};
+  const groups = (hooks.SessionEnd || [])
+    .map(g => ({ ...g, hooks: (g.hooks || []).filter(h => !isOurHook(h)) }))
+    .filter(g => g.hooks.length);
+  if (groups.length) hooks.SessionEnd = groups; else delete hooks.SessionEnd;
+  if (Object.keys(hooks).length) data.hooks = hooks; else delete data.hooks;
+  return data;
+}
+
+function sweepMinutes() {
+  try { return Math.round(+fs.readFileSync(PLIST, 'utf8').match(/StartInterval<\/key>\s*<integer>(\d+)/)[1] / 60); }
+  catch { return 0; }
+}
+
+function plistText(node, minutes) {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${xml(node)}</string>
+    <string>${xml(SELF)}</string>
+    <string>clean</string>
+    <string>--quiet</string>
+    <string>--why</string>
+    <string>safety net</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>${xml(path.dirname(node))}:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
+  <key>StartInterval</key><integer>${minutes * 60}</integer>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityIO</key><true/>
+  <key>Nice</key><integer>10</integer>
+  <key>StandardErrorPath</key><string>${xml(LOG_FILE.replace(/\.log$/, '.err'))}</string>
+</dict>
+</plist>
+`;
+}
+
+function skillText() {
+  const cmd = shq(SELF);
+  return `---
+name: ccsweep
+description: List or stop the processes Claude Code chats started on this Mac (dev servers, databases, scripts, test browsers) and clean up what closed chats left running. Use for /ccsweep, "what has Claude left running", "clean up leftover processes", "stop the servers you started", "what is draining my battery".
+---
+
+# ccsweep
+
+Run \`${cmd} list\` and show the user the table it prints.
+
+- To stop everything closed chats left running: \`${cmd} clean\`.
+- To stop particular services: \`${cmd} stop <PID> ...\` with PIDs from the list. An app such as Docker Desktop is asked to quit.
+- Ask before stopping anything that belongs to another open chat; that chat may still be using it. What you started in this chat ("this one") is yours to stop once your task is done.
+- \`${cmd} log\` shows what was stopped and when.
+`;
+}
+
+function install(minutes) {
+  if (/^(\/private)?\/(tmp|var\/folders)\//.test(SELF)) {
+    console.log('ccsweep is running from a temporary folder. Move it somewhere permanent (for example ~/.local/bin) and run "ccsweep install" from there.');
+    process.exit(1);
+  }
+  const node = findNode();
+
+  const { text, data } = readSettings();
+  withoutOurHook(data);
+  data.hooks = data.hooks || {};
+  (data.hooks.SessionEnd = data.hooks.SessionEnd || [])
+    .push({ hooks: [{ type: 'command', command: `${shq(node)} ${shq(SELF)} hook-end`, timeout: 10 }] });
+  writeSettings(text, data);
+
+  fs.mkdirSync(path.dirname(PLIST), { recursive: true });
+  fs.writeFileSync(PLIST, plistText(node, minutes));
+  run('launchctl', ['bootout', `gui/${UID}/${LABEL}`]);
+  let boot = run('launchctl', ['bootstrap', `gui/${UID}`, PLIST]);
+  if (!boot.ok) { sleep(1000); boot = run('launchctl', ['bootstrap', `gui/${UID}`, PLIST]); }
+
+  fs.mkdirSync(SKILL_DIR, { recursive: true });
+  fs.writeFileSync(path.join(SKILL_DIR, 'SKILL.md'), skillText());
+
+  console.log(`ccsweep ${VERSION} is installed.
+  ✓ stops what a chat started when the chat ends    (SessionEnd hook in ${tidy(SETTINGS)})
+  ${boot.ok ? '✓' : '✗'} safety net every ${minutes} min for chats that closed without the hook${boot.ok ? '' : `  (launchctl: ${boot.stderr.trim()})`}
+  ✓ /ccsweep in Claude chats                        (skill in ${tidy(SKILL_DIR)})
+
+Apps such as Docker Desktop are never stopped automatically. Log: ${tidy(LOG_FILE)}
+macOS may notify you once that software from your Node.js publisher (for example "Node.js
+Foundation") can run in the background; that is the safety net. Keep it allowed.
+Restart open Claude chats for the hook to take effect in them.`);
+}
+
+function uninstall() {
+  const { text, data } = readSettings();
+  if (text !== null) {
+    const before = JSON.stringify(data);
+    withoutOurHook(data);
+    if (JSON.stringify(data) !== before) writeSettings(text, data);
+  }
+  run('launchctl', ['bootout', `gui/${UID}/${LABEL}`]);
+  fs.rmSync(PLIST, { force: true });
+  fs.rmSync(SKILL_DIR, { recursive: true, force: true });
+  console.log(`ccsweep's hook, safety net and skill are removed. The log stays at ${tidy(LOG_FILE)}.
+To remove the command itself: rm ${shq(SELF)}`);
+}
+
+function status() {
+  const { data } = readSettings();
+  const hook = ((data.hooks || {}).SessionEnd || []).some(g => (g.hooks || []).some(isOurHook));
+  const sweep = run('launchctl', ['print', `gui/${UID}/${LABEL}`]).ok;
+  const skill = fs.existsSync(path.join(SKILL_DIR, 'SKILL.md'));
+  const mark = on => (on ? 'on ' : 'off');
+  console.log(`ccsweep ${VERSION}  ${tidy(SELF)}
+  ${mark(hook)}  stop what a chat started when it ends
+  ${mark(sweep)}  safety net${sweep ? ` every ${sweepMinutes()} min` : ''}
+  ${mark(skill)}  /ccsweep in Claude chats
+  log  ${tidy(LOG_FILE)}`);
+  if (!hook || !sweep || !skill) console.log('\nRun "ccsweep install" to turn everything on.');
+}
+
+// ---------------------------------------------------------------- commands
+
+function hookEnd(dryRun) {
+  let input = {};
+  try { if (!process.stdin.isTTY) input = JSON.parse(fs.readFileSync(0, 'utf8') || '{}'); } catch { /* no input */ }
+  if (WINDOW_STAYS_OPEN.has(input.reason)) return;
+  const { procs } = snapshot();
+  const claude = ancestry(procs, process.pid).find(isClaudeBinary);
+  const claudePid = claude ? claude.pid : +process.env.CLAUDE_PID || 0;
+  if (!claudePid) return;
+  const args = ['stop', '--claude-pid', String(claudePid), '--why', `chat closed (${input.reason || 'ended'})`];
+  if (dryRun) return main([...args, '--dry-run']);
+  // Detached, so the cleanup finishes even after Claude Code has exited.
+  spawn(process.execPath, [SELF, ...args, '--quiet'], { detached: true, stdio: 'ignore' }).unref();
+}
+
+const USAGE = `ccsweep ${VERSION}: see and stop what Claude Code chats started on your Mac
+
+  ccsweep                  list; in a terminal it then asks what to stop
+  ccsweep list [--json]    list only
+  ccsweep clean            stop everything closed chats left running (apps are skipped)
+  ccsweep stop PID...      stop the services these PIDs belong to (an app is asked to quit)
+  ccsweep log              what was stopped, and when
+  ccsweep install [--every MIN]   stop on chat close + safety net (default every 5 min) + /ccsweep
+  ccsweep uninstall        undo install
+  ccsweep status           what is installed
+  --dry-run                with clean or stop: show what would stop, stop nothing`;
+
+async function main(argv) {
+  if (process.platform !== 'darwin') { console.error('ccsweep works on macOS only, for now.'); process.exit(1); }
+  const valueFlags = new Set(['--why', '--claude-pid', '--every']);
+  const flags = new Set();
+  const values = {};
+  const positional = [];
+  for (let i = 0; i < argv.length; i++) {
+    if (valueFlags.has(argv[i])) values[argv[i]] = argv[++i];
+    else if (argv[i].startsWith('-')) flags.add(argv[i]);
+    else positional.push(argv[i]);
+  }
+  if (flags.has('--version') || flags.has('-v')) { console.log(VERSION); return; }
+  if (flags.has('--help') || flags.has('-h')) { console.log(USAGE); return; }
+  const interactive = process.stdout.isTTY && process.stdin.isTTY;
+  const cmd = positional.shift() || (interactive ? 'menu' : 'list');
+  const dryRun = flags.has('--dry-run');
+  const quiet = flags.has('--quiet');
+  const why = values['--why'] || (cmd === 'clean' ? 'clean' : 'by hand');
+
+  switch (cmd) {
+    case 'list':
+    case 'menu': {
+      const items = collect();
+      enrich(items);
+      if (flags.has('--json')) { console.log(JSON.stringify(items.map(toJson), null, 2)); return; }
+      printList(items);
+      printFooter(items, cmd === 'menu');
+      if (cmd !== 'menu' || !items.length) return;
+      const answer = (await ask('\nStop which? numbers (1 3) · c = closed chats · a = all except apps · Enter = nothing: '))
+        .toLowerCase();
+      const pick = new Set();
+      for (const tok of answer.split(/[\s,]+/).filter(Boolean)) {
+        if (tok === 'c') items.filter(isLeftover).forEach(i => pick.add(i));
+        else if (tok === 'a') items.filter(i => !i.app).forEach(i => pick.add(i));
+        else if (/^\d+$/.test(tok) && items[+tok - 1]) pick.add(items[+tok - 1]);
+      }
+      if (pick.size) stopItems([...pick], why);
+      return;
+    }
+    case 'clean': {
+      const targets = collect().filter(isLeftover);
+      if (targets.length) enrich(targets);
+      stopItems(targets, why, { dryRun, quiet });
+      return;
+    }
+    case 'stop': {
+      const items = collect();
+      const claudePid = +values['--claude-pid'] || 0;
+      let targets;
+      if (claudePid) {
+        targets = items.filter(i => i.claudePid === claudePid && !i.app);
+      } else {
+        const pids = positional.map(Number).filter(Boolean);
+        if (!pids.length) { console.log('Give the PIDs to stop; "ccsweep list" shows them.'); return; }
+        targets = items.filter(i => i.tree.some(q => pids.includes(q.pid)));
+        const missing = pids.filter(pid => !targets.some(i => i.tree.some(q => q.pid === pid)));
+        if (missing.length && !quiet) console.log(`Not started by a Claude chat, or already gone: ${missing.join(', ')}`);
+      }
+      if (targets.length) enrich(targets);
+      stopItems(targets, why, { dryRun, quiet });
+      return;
+    }
+    case 'log':
+      try { console.log(fs.readFileSync(LOG_FILE, 'utf8').trimEnd().split('\n').slice(-40).join('\n')); }
+      catch { console.log('Nothing has been stopped yet.'); }
+      return;
+    case 'install': {
+      const minutes = Math.max(1, Math.round(+values['--every'] || 5));
+      install(minutes);
+      return;
+    }
+    case 'uninstall': uninstall(); return;
+    case 'status': status(); return;
+    case 'hook-end': hookEnd(dryRun); return;
+    default: console.log(USAGE);
+  }
+}
+
+main(process.argv.slice(2)).catch(e => {
+  console.error('ccsweep: ' + ((e && e.message) || e));
+  process.exit(1);
+});

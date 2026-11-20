@@ -1,0 +1,31 @@
+{
+  "name": "ccsweep",
+  "version": "1.0.0",
+  "description": "See and stop the dev servers, databases and scripts that Claude Code chats leave running on your Mac.",
+  "bin": {
+    "ccsweep": "ccsweep"
+  },
+  "files": [
+    "ccsweep"
+  ],
+  "os": [
+    "darwin"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "claude-code",
+    "macos",
+    "cli",
+    "processes",
+    "battery"
+  ],
+  "author": "Prathamesh Pawar",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Prathameshppawar/ccsweep.git"
+  },
+  "homepage": "https://github.com/Prathameshppawar/ccsweep#readme"
+}
